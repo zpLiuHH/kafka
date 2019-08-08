@@ -16,11 +16,12 @@
  */
 package org.apache.kafka.clients;
 
+import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.Node;
-import org.apache.kafka.common.errors.AuthenticationException;
 import org.apache.kafka.common.requests.MetadataResponse;
 import org.apache.kafka.common.requests.RequestHeader;
 
+import java.io.Closeable;
 import java.util.List;
 
 /**
@@ -29,7 +30,7 @@ import java.util.List;
  * <p>
  * This class is not thread-safe!
  */
-interface MetadataUpdater {
+public interface MetadataUpdater extends Closeable {
 
     /**
      * Gets the current cluster info without blocking.
@@ -63,11 +64,11 @@ interface MetadataUpdater {
     void handleDisconnection(String destination);
 
     /**
-     * Handle authentication failure. Propagate the authentication exception if awaiting metadata.
+     * Handle failure. Propagate the exception if awaiting metadata.
      *
-     * @param exception authentication exception from broker
+     * @param fatalException exception corresponding to the failure
      */
-    void handleAuthenticationFailure(AuthenticationException exception);
+    void handleFatalException(KafkaException fatalException);
 
     /**
      * Handle responses for metadata requests.
@@ -82,4 +83,10 @@ interface MetadataUpdater {
      * start of the update if possible (see `maybeUpdate` for more information).
      */
     void requestUpdate();
+
+    /**
+     * Close this updater.
+     */
+    @Override
+    void close();
 }

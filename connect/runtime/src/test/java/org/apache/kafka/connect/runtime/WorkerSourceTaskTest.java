@@ -26,6 +26,8 @@ import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.runtime.ConnectMetrics.MetricGroup;
 import org.apache.kafka.connect.runtime.WorkerSourceTask.SourceTaskMetricsGroup;
+import org.apache.kafka.connect.runtime.distributed.ClusterConfigState;
+import org.apache.kafka.connect.runtime.errors.RetryWithToleranceOperatorTest;
 import org.apache.kafka.connect.runtime.isolation.Plugins;
 import org.apache.kafka.connect.runtime.standalone.StandaloneConfig;
 import org.apache.kafka.connect.source.SourceRecord;
@@ -52,6 +54,7 @@ import org.powermock.core.classloader.annotations.PowerMockIgnore;
 import org.powermock.modules.junit4.PowerMockRunner;
 import org.powermock.reflect.Whitebox;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -71,7 +74,8 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
-@PowerMockIgnore("javax.management.*")
+@PowerMockIgnore({"javax.management.*",
+                  "org.apache.kafka.connect.runtime.isolation.*"})
 @RunWith(PowerMockRunner.class)
 public class WorkerSourceTaskTest extends ThreadedTest {
     private static final String TOPIC = "topic";
@@ -102,6 +106,7 @@ public class WorkerSourceTaskTest extends ThreadedTest {
     @Mock private KafkaProducer<byte[], byte[]> producer;
     @Mock private OffsetStorageReader offsetReader;
     @Mock private OffsetStorageWriter offsetWriter;
+    @Mock private ClusterConfigState clusterConfigState;
     private WorkerSourceTask workerTask;
     @Mock private Future<RecordMetadata> sendFuture;
     @MockStrict private TaskStatus.Listener statusListener;
@@ -146,7 +151,8 @@ public class WorkerSourceTaskTest extends ThreadedTest {
 
     private void createWorkerTask(TargetState initialState) {
         workerTask = new WorkerSourceTask(taskId, sourceTask, statusListener, initialState, keyConverter, valueConverter, headerConverter,
-                transformationChain, producer, offsetReader, offsetWriter, config, metrics, plugins.delegatingLoader(), Time.SYSTEM);
+                transformationChain, producer, offsetReader, offsetWriter, config, clusterConfigState, metrics, plugins.delegatingLoader(), Time.SYSTEM,
+                RetryWithToleranceOperatorTest.NOOP_OPERATOR);
     }
 
     @Test
@@ -164,7 +170,7 @@ public class WorkerSourceTaskTest extends ThreadedTest {
             }
         });
 
-        producer.close(EasyMock.anyLong(), EasyMock.anyObject(TimeUnit.class));
+        producer.close(EasyMock.anyObject(Duration.class));
         EasyMock.expectLastCall();
 
         transformationChain.close();
@@ -212,7 +218,7 @@ public class WorkerSourceTaskTest extends ThreadedTest {
         statusListener.onShutdown(taskId);
         EasyMock.expectLastCall();
 
-        producer.close(EasyMock.anyLong(), EasyMock.anyObject(TimeUnit.class));
+        producer.close(EasyMock.anyObject(Duration.class));
         EasyMock.expectLastCall();
 
         transformationChain.close();
@@ -261,7 +267,7 @@ public class WorkerSourceTaskTest extends ThreadedTest {
         statusListener.onShutdown(taskId);
         EasyMock.expectLastCall();
 
-        producer.close(EasyMock.anyLong(), EasyMock.anyObject(TimeUnit.class));
+        producer.close(EasyMock.anyObject(Duration.class));
         EasyMock.expectLastCall();
 
         transformationChain.close();
@@ -310,7 +316,7 @@ public class WorkerSourceTaskTest extends ThreadedTest {
         EasyMock.expectLastCall();
         expectOffsetFlush(true);
 
-        producer.close(EasyMock.anyLong(), EasyMock.anyObject(TimeUnit.class));
+        producer.close(EasyMock.anyObject(Duration.class));
         EasyMock.expectLastCall();
 
         transformationChain.close();
@@ -354,7 +360,7 @@ public class WorkerSourceTaskTest extends ThreadedTest {
         statusListener.onShutdown(taskId);
         EasyMock.expectLastCall();
 
-        producer.close(EasyMock.anyLong(), EasyMock.anyObject(TimeUnit.class));
+        producer.close(EasyMock.anyObject(Duration.class));
         EasyMock.expectLastCall();
 
         transformationChain.close();
@@ -399,7 +405,7 @@ public class WorkerSourceTaskTest extends ThreadedTest {
         statusListener.onShutdown(taskId);
         EasyMock.expectLastCall();
 
-        producer.close(EasyMock.anyLong(), EasyMock.anyObject(TimeUnit.class));
+        producer.close(EasyMock.anyObject(Duration.class));
         EasyMock.expectLastCall();
 
         transformationChain.close();
@@ -589,7 +595,7 @@ public class WorkerSourceTaskTest extends ThreadedTest {
         statusListener.onShutdown(taskId);
         EasyMock.expectLastCall();
 
-        producer.close(EasyMock.anyLong(), EasyMock.anyObject(TimeUnit.class));
+        producer.close(EasyMock.anyObject(Duration.class));
         EasyMock.expectLastCall();
 
         transformationChain.close();
@@ -856,7 +862,7 @@ public class WorkerSourceTaskTest extends ThreadedTest {
         if (minimumPollCountExpected > 0) {
             assertTrue(pollBatchTimeMax >= 0.0d);
         }
-        assertTrue(pollBatchTimeAvg >= 0.0d);
+        assertTrue(Double.isNaN(pollBatchTimeAvg) || pollBatchTimeAvg > 0.0d);
         double activeCount = metrics.currentMetricValueAsDouble(sourceTaskGroup, "source-record-active-count");
         double activeCountMax = metrics.currentMetricValueAsDouble(sourceTaskGroup, "source-record-active-count-max");
         assertEquals(0, activeCount, 0.000001d);

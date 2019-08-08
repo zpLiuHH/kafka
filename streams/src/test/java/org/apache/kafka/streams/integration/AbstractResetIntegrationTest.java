@@ -16,15 +16,15 @@
  */
 package org.apache.kafka.streams.integration;
 
-import kafka.admin.AdminClient;
 import kafka.tools.StreamsResetter;
 import org.apache.kafka.clients.CommonClientConfigs;
-import org.apache.kafka.clients.admin.KafkaAdminClient;
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.ConsumerGroupDescription;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.producer.ProducerConfig;
-import org.apache.kafka.common.errors.TimeoutException;
 import org.apache.kafka.common.config.SslConfigs;
 import org.apache.kafka.common.config.types.Password;
+import org.apache.kafka.common.internals.Topic;
 import org.apache.kafka.common.serialization.LongDeserializer;
 import org.apache.kafka.common.serialization.LongSerializer;
 import org.apache.kafka.common.serialization.Serdes;
@@ -39,10 +39,8 @@ import org.apache.kafka.streams.Topology;
 import org.apache.kafka.streams.integration.utils.EmbeddedKafkaCluster;
 import org.apache.kafka.streams.integration.utils.IntegrationTestUtils;
 import org.apache.kafka.streams.kstream.KStream;
-import org.apache.kafka.streams.kstream.KeyValueMapper;
 import org.apache.kafka.streams.kstream.Produced;
 import org.apache.kafka.streams.kstream.TimeWindows;
-import org.apache.kafka.streams.kstream.Windowed;
 import org.apache.kafka.test.IntegrationTest;
 import org.apache.kafka.test.TestCondition;
 import org.apache.kafka.test.TestUtils;
@@ -56,6 +54,7 @@ import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileWriter;
 import java.text.SimpleDateFormat;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
@@ -63,8 +62,9 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ExecutionException;
 
+import static java.time.Duration.ofMillis;
 import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.MatcherAssert.assertThat;
 
@@ -75,20 +75,15 @@ public abstract class AbstractResetIntegrationTest {
 
     private static MockTime mockTime;
     private static KafkaStreams streams;
-    private static AdminClient adminClient = null;
-    private static KafkaAdminClient kafkaAdminClient = null;
+    private static Admin adminClient = null;
 
     abstract Map<String, Object> getClientSslConfig();
 
     @AfterClass
     public static void afterClassCleanup() {
         if (adminClient != null) {
-            adminClient.close();
+            adminClient.close(Duration.ofSeconds(10));
             adminClient = null;
-        }
-        if (kafkaAdminClient != null) {
-            kafkaAdminClient.close(10, TimeUnit.SECONDS);
-            kafkaAdminClient = null;
         }
     }
 
@@ -100,24 +95,35 @@ public abstract class AbstractResetIntegrationTest {
 
     private void prepareEnvironment() {
         if (adminClient == null) {
-            adminClient = AdminClient.create(commonClientConfig);
-        }
-        if (kafkaAdminClient == null) {
-            kafkaAdminClient = (KafkaAdminClient) org.apache.kafka.clients.admin.AdminClient.create(commonClientConfig);
+            adminClient = Admin.create(commonClientConfig);
         }
 
-        // we align time to seconds to get clean window boundaries and thus ensure the same result for each run
-        // otherwise, input records could fall into different windows for different runs depending on the initial mock time
-        final long alignedTime = (System.currentTimeMillis() / 1000 + 1) * 1000;
-        mockTime = cluster.time;
-        mockTime.setCurrentTimeMs(alignedTime);
+        boolean timeSet = false;
+        while (!timeSet) {
+            timeSet = setCurrentTime();
+        }
+    }
+
+    private boolean setCurrentTime() {
+        boolean currentTimeSet = false;
+        try {
+            mockTime = cluster.time;
+            // we align time to seconds to get clean window boundaries and thus ensure the same result for each run
+            // otherwise, input records could fall into different windows for different runs depending on the initial mock time
+            final long alignedTime = (System.currentTimeMillis() / 1000 + 1) * 1000;
+            mockTime.setCurrentTimeMs(alignedTime);
+            currentTimeSet = true;
+        } catch (final IllegalArgumentException e) {
+            // don't care will retry until set
+        }
+        return currentTimeSet;
     }
 
     private void prepareConfigs() {
         commonClientConfig = new Properties();
         commonClientConfig.put(CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG, cluster.bootstrapServers());
 
-        Map<String, Object> sslConfig = getClientSslConfig();
+        final Map<String, Object> sslConfig = getClientSslConfig();
         if (sslConfig != null) {
             commonClientConfig.put(SslConfigs.SSL_TRUSTSTORE_LOCATION_CONFIG, sslConfig.get(SslConfigs.SSL_TRUSTSTORE_LOCATION_CONFIG));
             commonClientConfig.put(SslConfigs.SSL_TRUSTSTORE_PASSWORD_CONFIG, ((Password) sslConfig.get(SslConfigs.SSL_TRUSTSTORE_PASSWORD_CONFIG)).value());
@@ -147,7 +153,6 @@ public abstract class AbstractResetIntegrationTest {
         streamsConfig.put(ConsumerConfig.HEARTBEAT_INTERVAL_MS_CONFIG, 100);
         streamsConfig.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
         streamsConfig.put(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG, "" + STREAMS_CONSUMER_TIMEOUT);
-        streamsConfig.put(IntegrationTestUtils.INTERNAL_LEAVE_GROUP_ON_CLOSE, true);
         streamsConfig.putAll(commonClientConfig);
     }
 
@@ -163,14 +168,15 @@ public abstract class AbstractResetIntegrationTest {
 
     private static final long STREAMS_CONSUMER_TIMEOUT = 2000L;
     private static final long CLEANUP_CONSUMER_TIMEOUT = 2000L;
-    private static final int TIMEOUT_MULTIPLIER = 5;
+    private static final int TIMEOUT_MULTIPLIER = 15;
 
     private class ConsumerGroupInactiveCondition implements TestCondition {
         @Override
         public boolean conditionMet() {
             try {
-                return adminClient.describeConsumerGroup(appID, 0).consumers().get().isEmpty();
-            } catch (final TimeoutException e) {
+                final ConsumerGroupDescription groupDescription = adminClient.describeConsumerGroups(Collections.singletonList(appID)).describedGroups().get(appID).get();
+                return groupDescription.members().isEmpty();
+            } catch (final ExecutionException | InterruptedException e) {
                 return false;
             }
         }
@@ -191,30 +197,30 @@ public abstract class AbstractResetIntegrationTest {
 
     void cleanupTest() throws Exception {
         if (streams != null) {
-            streams.close(30, TimeUnit.SECONDS);
+            streams.close(Duration.ofSeconds(30));
         }
         IntegrationTestUtils.purgeLocalStreamsState(streamsConfig);
     }
 
     private void add10InputElements() throws java.util.concurrent.ExecutionException, InterruptedException {
-        List<KeyValue<Long, String>> records = Arrays.asList(KeyValue.pair(0L, "aaa"),
-                KeyValue.pair(1L, "bbb"),
-                KeyValue.pair(0L, "ccc"),
-                KeyValue.pair(1L, "ddd"),
-                KeyValue.pair(0L, "eee"),
-                KeyValue.pair(1L, "fff"),
-                KeyValue.pair(0L, "ggg"),
-                KeyValue.pair(1L, "hhh"),
-                KeyValue.pair(0L, "iii"),
-                KeyValue.pair(1L, "jjj"));
+        final List<KeyValue<Long, String>> records = Arrays.asList(KeyValue.pair(0L, "aaa"),
+                                                                   KeyValue.pair(1L, "bbb"),
+                                                                   KeyValue.pair(0L, "ccc"),
+                                                                   KeyValue.pair(1L, "ddd"),
+                                                                   KeyValue.pair(0L, "eee"),
+                                                                   KeyValue.pair(1L, "fff"),
+                                                                   KeyValue.pair(0L, "ggg"),
+                                                                   KeyValue.pair(1L, "hhh"),
+                                                                   KeyValue.pair(0L, "iii"),
+                                                                   KeyValue.pair(1L, "jjj"));
 
-        for (KeyValue<Long, String> record : records) {
+        for (final KeyValue<Long, String> record : records) {
             mockTime.sleep(10);
             IntegrationTestUtils.produceKeyValuesSynchronouslyWithTimestamp(INPUT_TOPIC, Collections.singleton(record), producerConfig, mockTime.milliseconds());
         }
     }
 
-    void shouldNotAllowToResetWhileStreamsIsRunning() throws Exception {
+    void shouldNotAllowToResetWhileStreamsIsRunning() {
         appID = testId + "-not-reset-during-runtime";
         final String[] parameters = new String[] {
             "--application-id", appID,
@@ -324,7 +330,7 @@ public abstract class AbstractResetIntegrationTest {
 
         // insert bad record to make sure intermediate user topic gets seekToEnd()
         mockTime.sleep(1);
-        KeyValue<Long, String> badMessage = new KeyValue<>(-1L, "badRecord-ShouldBeSkipped");
+        final KeyValue<Long, String> badMessage = new KeyValue<>(-1L, "badRecord-ShouldBeSkipped");
         IntegrationTestUtils.produceKeyValuesSynchronouslyWithTimestamp(
             INTERMEDIATE_USER_TOPIC,
             Collections.singleton(badMessage),
@@ -379,9 +385,8 @@ public abstract class AbstractResetIntegrationTest {
 
         // RESET
         final File resetFile = File.createTempFile("reset", ".csv");
-        try (BufferedWriter writer = new BufferedWriter(new FileWriter(resetFile))) {
+        try (final BufferedWriter writer = new BufferedWriter(new FileWriter(resetFile))) {
             writer.write(INPUT_TOPIC + ",0,1");
-            writer.close();
         }
 
         streams = new KafkaStreams(setupTopologyWithoutIntermediateUserTopic(), streamsConfig);
@@ -423,9 +428,8 @@ public abstract class AbstractResetIntegrationTest {
 
         // RESET
         final File resetFile = File.createTempFile("reset", ".csv");
-        try (BufferedWriter writer = new BufferedWriter(new FileWriter(resetFile))) {
+        try (final BufferedWriter writer = new BufferedWriter(new FileWriter(resetFile))) {
             writer.write(INPUT_TOPIC + ",0,1");
-            writer.close();
         }
 
         streams = new KafkaStreams(setupTopologyWithoutIntermediateUserTopic(), streamsConfig);
@@ -471,9 +475,8 @@ public abstract class AbstractResetIntegrationTest {
 
         // RESET
         final File resetFile = File.createTempFile("reset", ".csv");
-        try (BufferedWriter writer = new BufferedWriter(new FileWriter(resetFile))) {
+        try (final BufferedWriter writer = new BufferedWriter(new FileWriter(resetFile))) {
             writer.write(INPUT_TOPIC + ",0,1");
-            writer.close();
         }
 
         streams = new KafkaStreams(setupTopologyWithoutIntermediateUserTopic(), streamsConfig);
@@ -505,12 +508,7 @@ public abstract class AbstractResetIntegrationTest {
         final KStream<Long, String> input = builder.stream(INPUT_TOPIC);
 
         // use map to trigger internal re-partitioning before groupByKey
-        input.map(new KeyValueMapper<Long, String, KeyValue<Long, String>>() {
-            @Override
-            public KeyValue<Long, String> apply(final Long key, final String value) {
-                return new KeyValue<>(key, value);
-            }
-        })
+        input.map(KeyValue::new)
             .groupByKey()
             .count()
             .toStream()
@@ -518,15 +516,10 @@ public abstract class AbstractResetIntegrationTest {
 
         input.through(INTERMEDIATE_USER_TOPIC)
             .groupByKey()
-            .windowedBy(TimeWindows.of(35).advanceBy(10))
+            .windowedBy(TimeWindows.of(ofMillis(35)).advanceBy(ofMillis(10)))
             .count()
             .toStream()
-            .map(new KeyValueMapper<Windowed<Long>, Long, KeyValue<Long, Long>>() {
-                @Override
-                public KeyValue<Long, Long> apply(final Windowed<Long> key, final Long value) {
-                    return new KeyValue<>(key.window().start() + key.window().end(), value);
-                }
-            })
+            .map((key, value) -> new KeyValue<>(key.window().start() + key.window().end(), value))
             .to(outputTopic2, Produced.with(Serdes.Long(), Serdes.Long()));
 
         return builder.build();
@@ -538,12 +531,8 @@ public abstract class AbstractResetIntegrationTest {
         final KStream<Long, String> input = builder.stream(INPUT_TOPIC);
 
         // use map to trigger internal re-partitioning before groupByKey
-        input.map(new KeyValueMapper<Long, String, KeyValue<Long, Long>>() {
-            @Override
-            public KeyValue<Long, Long> apply(final Long key, final String value) {
-                return new KeyValue<>(key, key);
-            }
-        }).to(OUTPUT_TOPIC, Produced.with(Serdes.Long(), Serdes.Long()));
+        input.map((key, value) -> new KeyValue<>(key, key))
+            .to(OUTPUT_TOPIC, Produced.with(Serdes.Long(), Serdes.Long()));
 
         return builder.build();
     }
@@ -581,7 +570,7 @@ public abstract class AbstractResetIntegrationTest {
             parameterList.add(resetScenarioArg);
         }
 
-        final String[] parameters = parameterList.toArray(new String[parameterList.size()]);
+        final String[] parameters = parameterList.toArray(new String[0]);
 
         final Properties cleanUpConfig = new Properties();
         cleanUpConfig.put(ConsumerConfig.HEARTBEAT_INTERVAL_MS_CONFIG, 100);
@@ -594,9 +583,11 @@ public abstract class AbstractResetIntegrationTest {
     private void assertInternalTopicsGotDeleted(final String intermediateUserTopic) throws Exception {
         // do not use list topics request, but read from the embedded cluster's zookeeper path directly to confirm
         if (intermediateUserTopic != null) {
-            cluster.waitForRemainingTopics(30000, INPUT_TOPIC, OUTPUT_TOPIC, OUTPUT_TOPIC_2, OUTPUT_TOPIC_2_RERUN, TestUtils.GROUP_METADATA_TOPIC_NAME, intermediateUserTopic);
+            cluster.waitForRemainingTopics(30000, INPUT_TOPIC, OUTPUT_TOPIC, OUTPUT_TOPIC_2, OUTPUT_TOPIC_2_RERUN,
+                    Topic.GROUP_METADATA_TOPIC_NAME, intermediateUserTopic);
         } else {
-            cluster.waitForRemainingTopics(30000, INPUT_TOPIC, OUTPUT_TOPIC, OUTPUT_TOPIC_2, OUTPUT_TOPIC_2_RERUN, TestUtils.GROUP_METADATA_TOPIC_NAME);
+            cluster.waitForRemainingTopics(30000, INPUT_TOPIC, OUTPUT_TOPIC, OUTPUT_TOPIC_2, OUTPUT_TOPIC_2_RERUN,
+                    Topic.GROUP_METADATA_TOPIC_NAME);
         }
     }
 }
